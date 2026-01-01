@@ -11,7 +11,6 @@ from langchain_groq import ChatGroq
 st.set_page_config(page_title="RAG Assistant", page_icon="📚")
 
 PERSIST_DIR = "chroma_db"
-COLLECTION_NAME = "rag_docs"
 
 # ---------------- UI ----------------
 st.title("📚 RAG Assistant")
@@ -19,52 +18,55 @@ st.write("Upload a TXT file and ask questions about it.")
 
 uploaded_file = st.file_uploader("Upload a .txt document", type=["txt"])
 
-question = st.text_input("Ask a question")
-
-# ---------------- LLM ----------------
-llm = ChatGroq(
-    model="llama3-8b-8192",
-    temperature=0,
-)
-
 # ---------------- EMBEDDINGS ----------------
 embeddings = HuggingFaceEmbeddings(
     model_name="sentence-transformers/all-MiniLM-L6-v2"
 )
 
-# ---------------- VECTOR STORE ----------------
+# ---------------- LOAD VECTOR STORE ----------------
 vectorstore = Chroma(
-    collection_name=COLLECTION_NAME,
-    embedding_function=embeddings,
     persist_directory=PERSIST_DIR,
+    embedding_function=embeddings
 )
 
-# ---------------- INGEST DOCUMENT ----------------
+# ---------------- FILE INGESTION ----------------
 if uploaded_file:
     text = uploaded_file.read().decode("utf-8")
 
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=500,
-        chunk_overlap=100,
+        chunk_overlap=100
     )
 
-    docs = splitter.split_text(text)
-    documents = [Document(page_content=d) for d in docs]
+    chunks = splitter.split_text(text)
+    documents = [Document(page_content=c) for c in chunks]
 
     vectorstore.add_documents(documents)
 
     st.success("✅ Document indexed successfully!")
 
-# ---------------- QUERY ----------------
+# ---------------- QUESTION ----------------
+question = st.text_input("Ask a question")
+
 if question:
-    retriever = vectorstore.as_retriever(search_kwargs={"k": 3})
-    docs = retriever.get_relevant_documents(question)
+    retriever = vectorstore.as_retriever(search_kwargs={"k": 4})
 
-    context = "\n\n".join(d.page_content for d in docs)
+    docs = retriever.invoke(question)
 
-    prompt = f"""
-Use ONLY the context below to answer the question.
-If the answer is not present, say "I don't know".
+    if not docs:
+        st.warning("No relevant content found.")
+    else:
+        context = "\n\n".join(d.page_content for d in docs)
+
+        llm = ChatGroq(
+            model="llama3-8b-8192",
+            temperature=0,
+            groq_api_key=st.secrets["GROQ_API_KEY"]
+        )
+
+        prompt = f"""
+You are a helpful assistant.
+Answer ONLY using the context below.
 
 Context:
 {context}
@@ -73,6 +75,7 @@ Question:
 {question}
 """
 
-    response = llm.invoke(prompt)
-    st.markdown("### 🤖 Answer")
-    st.write(response.content)
+        response = llm.invoke(prompt)
+
+        st.subheader("Answer")
+        st.write(response.content)
