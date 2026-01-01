@@ -19,3 +19,4 @@ faiss-cpu
 openai
 tiktoken
 langchain-groq
+langchain-text-splitters
