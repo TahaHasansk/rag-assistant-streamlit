@@ -7,7 +7,9 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_chroma import Chroma
 from langchain_groq import ChatGroq
-from langchain.chains import RetrievalQA
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.runnables import RunnablePassthrough
 
 from pypdf import PdfReader
 
@@ -124,7 +126,7 @@ retriever = vectorstore.as_retriever(search_kwargs={"k": 4})
 
 
 # -----------------------------
-# LLM (GROQ SAFE MODEL)
+# LLM (GROQ)
 # -----------------------------
 llm = ChatGroq(
     model="llama-3.1-8b-instant",
@@ -133,12 +135,33 @@ llm = ChatGroq(
 
 
 # -----------------------------
-# RAG CHAIN
+# PROMPT
 # -----------------------------
-qa_chain = RetrievalQA.from_chain_type(
-    llm=llm,
-    retriever=retriever,
-    return_source_documents=True,
+prompt = ChatPromptTemplate.from_template(
+    """You are a helpful assistant.
+Use ONLY the context below to answer the question.
+If the answer is not in the context, say you don't know.
+
+Context:
+{context}
+
+Question:
+{question}
+"""
+)
+
+
+# -----------------------------
+# RAG CHAIN (LC 1.x SAFE)
+# -----------------------------
+chain = (
+    {
+        "context": retriever | (lambda docs: "\n\n".join(d.page_content for d in docs)),
+        "question": RunnablePassthrough(),
+    }
+    | prompt
+    | llm
+    | StrOutputParser()
 )
 
 
@@ -149,11 +172,7 @@ question = st.text_input("Ask a question")
 
 if question:
     with st.spinner("Thinking..."):
-        result = qa_chain.invoke({"query": question})
+        answer = chain.invoke(question)
 
     st.subheader("Answer")
-    st.write(result["result"])
-
-    st.subheader("Sources")
-    for doc in result["source_documents"]:
-        st.markdown(f"- **{doc.metadata.get('source', 'Unknown')}**")
+    st.write(answer)
