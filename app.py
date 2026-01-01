@@ -4,7 +4,7 @@ from typing import List
 
 from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_community.embeddings import SentenceTransformerEmbeddings
 from langchain_chroma import Chroma
 from langchain_groq import ChatGroq
 from langchain_core.prompts import ChatPromptTemplate
@@ -27,12 +27,16 @@ if "GROQ_API_KEY" not in os.environ:
     st.stop()
 
 # -----------------------------
-# EMBEDDINGS & VECTOR STORE
+# EMBEDDINGS (STREAMLIT SAFE)
 # -----------------------------
-embeddings = HuggingFaceEmbeddings(
-    model_name="sentence-transformers/all-MiniLM-L6-v2"
+embeddings = SentenceTransformerEmbeddings(
+    model_name="sentence-transformers/all-MiniLM-L6-v2",
+    device="cpu"
 )
 
+# -----------------------------
+# VECTOR STORE (PERSISTENT)
+# -----------------------------
 VECTOR_DIR = "chroma_db"
 
 vectorstore = Chroma(
@@ -40,99 +44,118 @@ vectorstore = Chroma(
     embedding_function=embeddings
 )
 
+retriever = vectorstore.as_retriever(search_kwargs={"k": 4})
+
 # -----------------------------
-# FILE UPLOAD (MULTI + TXT + PDF)
+# LLM (GROQ)
+# -----------------------------
+llm = ChatGroq(
+    model="llama3-70b-8192",
+    temperature=0
+)
+
+# -----------------------------
+# PROMPT
+# -----------------------------
+prompt = ChatPromptTemplate.from_messages(
+    [
+        (
+            "system",
+            "You are a helpful assistant. Answer ONLY using the provided context.\n"
+            "If the answer is not in the context, say you don't know."
+        ),
+        ("human", "Context:\n{context}\n\nQuestion:\n{question}")
+    ]
+)
+
+chain = prompt | llm | StrOutputParser()
+
+# -----------------------------
+# FILE PROCESSING
+# -----------------------------
+def read_txt(file) -> str:
+    return file.read().decode("utf-8", errors="ignore")
+
+def read_pdf(file) -> str:
+    reader = PdfReader(file)
+    text = ""
+    for page in reader.pages:
+        text += page.extract_text() or ""
+    return text
+
+def process_files(files: List) -> List[Document]:
+    documents: List[Document] = []
+
+    for file in files:
+        if file.name.lower().endswith(".txt"):
+            text = read_txt(file)
+        elif file.name.lower().endswith(".pdf"):
+            text = read_pdf(file)
+        else:
+            continue
+
+        if not text.strip():
+            continue
+
+        documents.append(
+            Document(
+                page_content=text,
+                metadata={"source": file.name}
+            )
+        )
+
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=1000,
+        chunk_overlap=150
+    )
+
+    return splitter.split_documents(documents)
+
+# -----------------------------
+# UI — FILE UPLOAD
 # -----------------------------
 uploaded_files = st.file_uploader(
-    "Upload documents",
+    "Upload TXT or PDF files",
     type=["txt", "pdf"],
     accept_multiple_files=True
 )
 
-def load_documents(files) -> List[Document]:
-    documents = []
-
-    for file in files:
-        if file.type == "text/plain":
-            text = file.read().decode("utf-8")
-            documents.append(
-                Document(
-                    page_content=text,
-                    metadata={"source": file.name}
-                )
-            )
-
-        elif file.type == "application/pdf":
-            reader = PdfReader(file)
-            full_text = ""
-            for page in reader.pages:
-                page_text = page.extract_text()
-                if page_text:
-                    full_text += page_text + "\n"
-
-            documents.append(
-                Document(
-                    page_content=full_text,
-                    metadata={"source": file.name}
-                )
-            )
-
-    return documents
-
 if uploaded_files:
-    with st.spinner("📄 Processing documents..."):
-        docs = load_documents(uploaded_files)
+    docs = process_files(uploaded_files)
 
-        splitter = RecursiveCharacterTextSplitter(
-            chunk_size=1000,
-            chunk_overlap=200
-        )
-
-        chunks = splitter.split_documents(docs)
-        vectorstore.add_documents(chunks)
-
-    st.success("✅ Documents indexed successfully!")
+    if docs:
+        vectorstore.add_documents(docs)
+        vectorstore.persist()
+        st.success("✅ Document(s) indexed successfully!")
+    else:
+        st.warning("⚠️ No readable text found in uploaded files.")
 
 # -----------------------------
-# QUESTION ANSWERING
+# UI — QUESTION ANSWERING
 # -----------------------------
-question = st.text_input("Ask a question")
+st.divider()
+st.subheader("Ask a question")
+
+question = st.text_input("Enter your question")
 
 if question:
-    retriever = vectorstore.as_retriever(search_kwargs={"k": 4})
+    retrieved_docs = retriever.invoke(question)
 
-    context_docs = retriever.invoke(question)
-    context_text = "\n\n".join(doc.page_content for doc in context_docs)
+    if not retrieved_docs:
+        st.info("No relevant context found.")
+    else:
+        context = "\n\n".join(doc.page_content for doc in retrieved_docs)
 
-    prompt = ChatPromptTemplate.from_template(
-        """
-You are a helpful assistant.
-Answer the question ONLY using the context below.
-If the answer is not in the context, say "I don't know".
-
-Context:
-{context}
-
-Question:
-{question}
-"""
-    )
-
-    llm = ChatGroq(
-        model="llama-3.1-8b-instant",
-        temperature=0
-    )
-
-    chain = (
-        prompt
-        | llm
-        | StrOutputParser()
-    )
-
-    with st.spinner("🤖 Thinking..."):
-        answer = chain.invoke(
-            {"context": context_text, "question": question}
+        response = chain.invoke(
+            {
+                "context": context,
+                "question": question
+            }
         )
 
-    st.markdown("### Answer")
-    st.write(answer)
+        st.markdown("### Answer")
+        st.write(response)
+
+        st.markdown("### Sources")
+        for doc in retrieved_docs:
+            st.write(f"- {doc.metadata.get('source', 'unknown')}")
