@@ -1,16 +1,13 @@
-import os
 import streamlit as st
-
 from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_chroma import Chroma
 from langchain_groq import ChatGroq
-
 from pypdf import PdfReader
 
 # =====================================================
-# PAGE CONFIG
+# PAGE CONFIG (Apple-style)
 # =====================================================
 st.set_page_config(
     page_title="RAG Assistant",
@@ -18,71 +15,86 @@ st.set_page_config(
     layout="wide"
 )
 
+st.markdown(
+    """
+    <style>
+    body {
+        background-color: #0e0e11;
+        color: #ffffff;
+    }
+    .block-container {
+        padding-top: 3rem;
+        max-width: 1100px;
+    }
+    input, textarea {
+        border-radius: 14px !important;
+        border: 1px solid #333 !important;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True
+)
+
 st.title("🧠 RAG Assistant")
-st.caption("Upload TXT or PDF documents and ask questions based on their content")
+st.caption("Upload a document. Ask questions. Get grounded answers.")
 
 # =====================================================
 # LLM (Groq)
 # =====================================================
 llm = ChatGroq(
-    model="llama-3.1-8b-instant",  # ✅ VALID MODEL
+    model="llama-3.1-8b-instant",
     temperature=0
 )
 
 # =====================================================
-# VECTORSTORE (cached)
+# SESSION STATE
 # =====================================================
-@st.cache_resource
-def get_vectorstore():
-    embeddings = HuggingFaceEmbeddings(
-        model_name="sentence-transformers/all-MiniLM-L6-v2"
-    )
-    return Chroma(
-        embedding_function=embeddings,
-        persist_directory="chroma_db"
-    )
-
-vectorstore = get_vectorstore()
+if "vectorstore" not in st.session_state:
+    st.session_state.vectorstore = None
 
 # =====================================================
 # FILE UPLOAD
 # =====================================================
 st.subheader("📄 Upload documents")
+
 uploaded_files = st.file_uploader(
-    "Upload TXT or PDF files",
+    "TXT or PDF only",
     type=["txt", "pdf"],
     accept_multiple_files=True
 )
 
 if uploaded_files:
-    documents = []
+    documents: list[Document] = []
 
-    for uploaded_file in uploaded_files:
-        if uploaded_file.name.endswith(".txt"):
-            text = uploaded_file.read().decode("utf-8", errors="ignore")
-            documents.append(
-                Document(
-                    page_content=text,
-                    metadata={"source": uploaded_file.name}
+    for file in uploaded_files:
+        if file.name.endswith(".txt"):
+            text = file.read().decode("utf-8", errors="ignore")
+            if text.strip():
+                documents.append(
+                    Document(
+                        page_content=text,
+                        metadata={"source": file.name}
+                    )
                 )
-            )
 
-        elif uploaded_file.name.endswith(".pdf"):
-            reader = PdfReader(uploaded_file)
-            for page_num, page in enumerate(reader.pages):
+        elif file.name.endswith(".pdf"):
+            reader = PdfReader(file)
+            for page_num, page in enumerate(reader.pages, start=1):
                 page_text = page.extract_text()
                 if page_text and page_text.strip():
                     documents.append(
                         Document(
                             page_content=page_text,
                             metadata={
-                                "source": uploaded_file.name,
-                                "page": page_num + 1
+                                "source": file.name,
+                                "page": page_num
                             }
                         )
                     )
 
-    if documents:
+    if not documents:
+        st.warning("No readable text found in uploaded files.")
+    else:
         splitter = RecursiveCharacterTextSplitter(
             chunk_size=1000,
             chunk_overlap=150
@@ -90,37 +102,52 @@ if uploaded_files:
 
         chunks = splitter.split_documents(documents)
 
-        # ✅ CRITICAL FIX: remove empty chunks
+        # 🔥 CRITICAL FIX: remove empty chunks
         chunks = [c for c in chunks if c.page_content.strip()]
 
-        if chunks:
-            vectorstore.add_documents(chunks)
-            st.success(f"✅ Added {len(chunks)} chunks to the knowledge base")
-        else:
-            st.warning("⚠️ No valid text found after splitting")
+        embeddings = HuggingFaceEmbeddings(
+            model_name="sentence-transformers/all-MiniLM-L6-v2"
+        )
+
+        # 🔥 CRITICAL FIX: NEW VECTORSTORE PER UPLOAD (NO PERSISTENCE)
+        st.session_state.vectorstore = Chroma.from_documents(
+            documents=chunks,
+            embedding=embeddings
+        )
+
+        st.success(f"Indexed {len(chunks)} chunks successfully.")
 
 # =====================================================
 # QUESTION ANSWERING
 # =====================================================
 st.divider()
-st.subheader("💬 Ask a Question")
+st.subheader("💬 Ask a question")
 
-question = st.text_input("Enter your question")
+question = st.text_input(
+    "What would you like to know?",
+    placeholder="What is this document about?"
+)
 
 if question:
-    retriever = vectorstore.as_retriever(search_kwargs={"k": 4})
-
-    # ✅ LangChain 1.x correct call
-    docs = retriever.invoke(question)
-
-    if not docs:
-        st.warning("No relevant context found.")
+    if st.session_state.vectorstore is None:
+        st.warning("Please upload a document first.")
     else:
-        context = "\n\n".join(d.page_content for d in docs)
+        retriever = st.session_state.vectorstore.as_retriever(
+            search_kwargs={"k": 4}
+        )
 
-        prompt = f"""
-You are a helpful assistant.
-Answer the question using ONLY the context below.
+        # ✅ CORRECT LangChain 1.x API
+        docs = retriever.invoke(question)
+
+        if not docs:
+            st.warning("No relevant information found.")
+        else:
+            context = "\n\n".join(doc.page_content for doc in docs)
+
+            prompt = f"""
+You are a precise assistant.
+Answer ONLY using the context below.
+If the answer is not present, say "Not found in the document."
 
 Context:
 {context}
@@ -131,19 +158,16 @@ Question:
 Answer:
 """
 
-        answer = llm.invoke(prompt)
+            response = llm.invoke(prompt)
 
-        st.markdown("### 🧠 Answer")
-        st.write(answer.content)
+            st.markdown("### 🧠 Answer")
+            st.write(response.content)
 
-        # =====================================================
-        # SOURCES
-        # =====================================================
-        st.markdown("### 📚 Sources")
-        for i, doc in enumerate(docs, start=1):
-            source = doc.metadata.get("source", "Unknown")
-            page = doc.metadata.get("page")
-            if page:
-                st.write(f"{i}. {source} (page {page})")
-            else:
-                st.write(f"{i}. {source}")
+            st.markdown("### 📚 Sources")
+            for i, doc in enumerate(docs, start=1):
+                source = doc.metadata.get("source", "Unknown")
+                page = doc.metadata.get("page")
+                if page:
+                    st.write(f"{i}. {source} — page {page}")
+                else:
+                    st.write(f"{i}. {source}")
