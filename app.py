@@ -8,36 +8,41 @@ from langchain_chroma import Chroma
 from langchain_groq import ChatGroq
 from langchain_core.prompts import ChatPromptTemplate
 
-# -------------------------------
-# Streamlit UI
-# -------------------------------
+# -----------------------------
+# STREAMLIT CONFIG
+# -----------------------------
 st.set_page_config(page_title="RAG Assistant", page_icon="📚")
 st.title("📚 RAG Assistant")
-st.write("Upload a TXT file and ask questions about it.")
+st.caption("Upload a TXT file and ask questions about it.")
 
-# -------------------------------
-# Environment
-# -------------------------------
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-if not GROQ_API_KEY:
-    st.error("❌ GROQ_API_KEY not set in Streamlit secrets")
+# -----------------------------
+# CHECK GROQ API KEY
+# -----------------------------
+if "GROQ_API_KEY" not in os.environ:
+    st.error("❌ GROQ_API_KEY not found. Add it in Streamlit → App settings → Secrets.")
     st.stop()
 
-# -------------------------------
-# Upload file
-# -------------------------------
-uploaded_file = st.file_uploader("Upload a .txt document", type=["txt"])
-
-# -------------------------------
-# Initialize embeddings once
-# -------------------------------
+# -----------------------------
+# EMBEDDINGS & VECTORSTORE
+# -----------------------------
 embeddings = HuggingFaceEmbeddings(
     model_name="sentence-transformers/all-MiniLM-L6-v2"
 )
 
-# -------------------------------
-# Handle document upload
-# -------------------------------
+VECTOR_DIR = "chroma_db"
+
+vectorstore = Chroma(
+    persist_directory=VECTOR_DIR,
+    embedding_function=embeddings
+)
+
+retriever = vectorstore.as_retriever(search_kwargs={"k": 4})
+
+# -----------------------------
+# FILE UPLOAD
+# -----------------------------
+uploaded_file = st.file_uploader("Upload a .txt document", type=["txt"])
+
 if uploaded_file:
     text = uploaded_file.read().decode("utf-8")
 
@@ -46,56 +51,48 @@ if uploaded_file:
         chunk_overlap=100
     )
 
-    chunks = splitter.split_text(text)
-
-    documents = [Document(page_content=chunk) for chunk in chunks]
-
-    vectorstore = Chroma.from_documents(
-        documents=documents,
-        embedding=embeddings
-    )
-
-    retriever = vectorstore.as_retriever(search_kwargs={"k": 4})
+    docs = splitter.split_documents([Document(page_content=text)])
+    vectorstore.add_documents(docs)
 
     st.success("✅ Document indexed successfully!")
 
-    # -------------------------------
-    # Ask a question
-    # -------------------------------
-    question = st.text_input("Ask a question")
+# -----------------------------
+# QUESTION INPUT
+# -----------------------------
+question = st.text_input("Ask a question")
 
-    ask = st.button("Ask")
+if question:
+    # Retrieve context
+    docs = retriever.invoke(question)
 
-    if ask and question:
-        # Retrieve documents (CORRECT API)
-        docs = retriever.invoke(question)
+    if not docs:
+        st.warning("No relevant context found.")
+        st.stop()
 
-        context = "\n\n".join(d.page_content for d in docs)
+    context = "\n\n".join(d.page_content for d in docs)
 
-        prompt = ChatPromptTemplate.from_template(
-            """You are a helpful assistant.
-Use ONLY the context below to answer.
-If the answer is not in the context, say "I don't know".
+    # -----------------------------
+    # PROMPT
+    # -----------------------------
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", "You are a helpful assistant. Answer ONLY using the context below."),
+        ("human", "Context:\n{context}\n\nQuestion:\n{question}")
+    ])
 
-Context:
-{context}
+    # -----------------------------
+    # GROQ LLM
+    # -----------------------------
+    llm = ChatGroq(
+        model="llama3-8b-8192",
+        temperature=0
+    )
 
-Question:
-{question}
-"""
-        )
+    chain = prompt | llm
 
-        llm = ChatGroq(
-            api_key=GROQ_API_KEY,
-            model="llama-3.1-70b-versatile",
-            temperature=0
-        )
+    response = chain.invoke({
+        "context": context,
+        "question": question
+    })
 
-        chain = prompt | llm
-
-        response = chain.invoke(
-            {"context": context, "question": question}
-        )
-
-        st.markdown("### Answer")
-        st.write(response.content)
+    st.subheader("Answer")
+    st.write(response.content)

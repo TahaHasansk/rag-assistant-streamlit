@@ -1,4 +1,4 @@
-langchain>=1.2.0
+langchain
 langchain-community
 chromadb
 sentence-transformers
@@ -9,7 +9,7 @@ langchain-ollama
 fastapi
 uvicorn[standard]
 streamlit
-langchain-core>=1.2.0
+langchain-core
 langchain-chroma
 pydantic
 requests
