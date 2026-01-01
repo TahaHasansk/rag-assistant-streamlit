@@ -1,84 +1,113 @@
 import streamlit as st
-import requests
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_community.vectorstores import Chroma
+from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_groq import ChatGroq
+import tempfile
+import os
 
 # ===============================
-# CONFIG
+# STREAMLIT CONFIG
 # ===============================
-API_URL = "http://localhost:8000"  # Backend must be running
-
 st.set_page_config(
     page_title="RAG Assistant",
+    page_icon="📚",
     layout="wide"
+)
+
+st.title("📚 RAG Assistant")
+st.caption("Upload a document and ask questions based only on its content.")
+
+# ===============================
+# GROQ LLM (FREE)
+# ===============================
+llm = ChatGroq(
+    api_key=st.secrets["GROQ_API_KEY"],
+    model="llama3-70b-8192",
+    temperature=0
 )
 
 # ===============================
 # SESSION STATE
 # ===============================
+if "vectorstore" not in st.session_state:
+    st.session_state.vectorstore = None
+
 if "chat_history" not in st.session_state:
     st.session_state.chat_history = []
 
 # ===============================
-# UI HEADER
-# ===============================
-st.title("📚 RAG Assistant")
-st.markdown("Upload a document and ask questions based on its content.")
-
-# ===============================
 # FILE UPLOAD
 # ===============================
-st.subheader("📄 Upload a TXT document")
+st.header("📄 Upload a TXT file")
 
 uploaded_file = st.file_uploader(
     "Choose a .txt file",
     type=["txt"]
 )
 
-if uploaded_file is not None:
-    with st.spinner("Uploading and indexing document..."):
-        try:
-            files = {
-                "file": (uploaded_file.name, uploaded_file.getvalue())
-            }
+if uploaded_file:
+    with st.spinner("Processing document..."):
+        text = uploaded_file.read().decode("utf-8")
 
-            response = requests.post(
-                f"{API_URL}/upload",
-                files=files,
-                timeout=60
-            )
+        splitter = RecursiveCharacterTextSplitter(
+            chunk_size=500,
+            chunk_overlap=100
+        )
+        chunks = splitter.split_text(text)
 
-            if response.status_code == 200:
-                st.success(response.json().get("message", "Uploaded successfully"))
-            else:
-                st.error(response.text)
+        embeddings = HuggingFaceEmbeddings(
+            model_name="sentence-transformers/all-MiniLM-L6-v2"
+        )
 
-        except Exception as e:
-            st.error(f"Upload failed: {e}")
+        st.session_state.vectorstore = Chroma.from_texts(
+            chunks,
+            embedding=embeddings
+        )
+
+    st.success("✅ Document indexed successfully!")
 
 # ===============================
-# QUESTION INPUT
+# QUESTION ASKING
 # ===============================
-st.divider()
-st.subheader("💬 Ask a question")
+st.header("💬 Ask a question")
 
 question = st.text_input("Enter your question")
 
 if st.button("Ask") and question:
-    with st.spinner("Thinking..."):
-        try:
-            response = requests.post(
-                f"{API_URL}/ask",
-                json={"question": question},
-                timeout=120
+    if st.session_state.vectorstore is None:
+        st.error("❌ Please upload a document first.")
+    else:
+        with st.spinner("Thinking..."):
+            docs = st.session_state.vectorstore.similarity_search(
+                question,
+                k=3
             )
 
-            if response.status_code == 200:
-                answer = response.json().get("answer", "")
-                st.session_state.chat_history.append((question, answer))
-            else:
-                st.error(response.text)
+            context = "\n\n".join(d.page_content for d in docs)
 
-        except Exception as e:
-            st.error(f"Request failed: {e}")
+            prompt = f"""
+You are a RAG assistant.
+Answer ONLY using the context below.
+If the answer is not present, say "I don't know."
+
+Context:
+{context}
+
+Question:
+{question}
+
+Answer:
+"""
+
+            response = llm.invoke(prompt)
+
+        st.session_state.chat_history.append(
+            ("You", question)
+        )
+        st.session_state.chat_history.append(
+            ("Assistant", response.content)
+        )
 
 # ===============================
 # CHAT HISTORY
@@ -86,7 +115,8 @@ if st.button("Ask") and question:
 st.divider()
 st.subheader("🧠 Chat History")
 
-for q, a in reversed(st.session_state.chat_history):
-    st.markdown(f"**You:** {q}")
-    st.markdown(f"**Assistant:** {a}")
-    st.markdown("---")
+for role, message in st.session_state.chat_history:
+    if role == "You":
+        st.markdown(f"**🧑 You:** {message}")
+    else:
+        st.markdown(f"**🤖 Assistant:** {message}")

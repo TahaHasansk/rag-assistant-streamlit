@@ -18,3 +18,4 @@ langchain-openai
 faiss-cpu
 openai
 tiktoken
+langchain-groq
