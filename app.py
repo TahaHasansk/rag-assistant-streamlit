@@ -1,59 +1,48 @@
-import streamlit as st
 import os
+import streamlit as st
 
-from typing import List
-from groq import Groq
-
-from langchain_core.documents import Document
+from langchain.schema import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_chroma import Chroma
+from langchain_groq import ChatGroq
+from langchain.schema import SystemMessage, HumanMessage
 
-# -----------------------------
+# -------------------------------------------------
 # Streamlit config
-# -----------------------------
+# -------------------------------------------------
 st.set_page_config(
     page_title="RAG Assistant",
     page_icon="📚",
-    layout="wide",
+    layout="centered",
 )
 
 st.title("📚 RAG Assistant")
 
-# -----------------------------
-# Secrets / API key
-# -----------------------------
+# -------------------------------------------------
+# API Key
+# -------------------------------------------------
 GROQ_API_KEY = st.secrets.get("GROQ_API_KEY") or os.getenv("GROQ_API_KEY")
 if not GROQ_API_KEY:
-    st.error("❌ GROQ_API_KEY is missing in Streamlit secrets.")
+    st.error("❌ GROQ_API_KEY missing in Streamlit secrets")
     st.stop()
 
-groq_client = Groq(api_key=GROQ_API_KEY)
+os.environ["GROQ_API_KEY"] = GROQ_API_KEY
 
-# -----------------------------
-# Embeddings + Vector DB
-# -----------------------------
-EMBEDDINGS = HuggingFaceEmbeddings(
-    model_name="sentence-transformers/all-MiniLM-L6-v2"
-)
+# -------------------------------------------------
+# Session state
+# -------------------------------------------------
+if "vectorstore" not in st.session_state:
+    st.session_state.vectorstore = None
 
-@st.cache_resource
-def load_vectorstore():
-    return Chroma(
-        persist_directory="chroma_db",
-        embedding_function=EMBEDDINGS,
-    )
-
-vectorstore = load_vectorstore()
-
-# -----------------------------
+# -------------------------------------------------
 # Upload document
-# -----------------------------
-st.subheader("📄 Upload a document")
+# -------------------------------------------------
+st.header("📄 Upload a document")
 
 uploaded_file = st.file_uploader(
-    "Upload a TXT document",
-    type=["txt"],
+    "Upload a TXT file",
+    type=["txt"]
 )
 
 if uploaded_file:
@@ -61,65 +50,60 @@ if uploaded_file:
 
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=500,
-        chunk_overlap=50,
+        chunk_overlap=100
     )
 
-    docs: List[Document] = [
-        Document(page_content=chunk)
-        for chunk in splitter.split_text(text)
-    ]
+    chunks = splitter.split_text(text)
 
-    vectorstore.add_documents(docs)
-    vectorstore.persist()
+    documents = [Document(page_content=chunk) for chunk in chunks]
+
+    embeddings = HuggingFaceEmbeddings(
+        model_name="sentence-transformers/all-MiniLM-L6-v2"
+    )
+
+    st.session_state.vectorstore = Chroma.from_documents(
+        documents=documents,
+        embedding=embeddings
+    )
 
     st.success("✅ Document indexed successfully!")
 
-# -----------------------------
-# Ask a question
-# -----------------------------
-st.subheader("💬 Ask a question")
+# -------------------------------------------------
+# Ask question
+# -------------------------------------------------
+st.header("💬 Ask a question")
 
 question = st.text_input("Enter your question")
 
-if st.button("Ask") and question.strip():
-
-    results = vectorstore.similarity_search(question, k=4)
-
-    if not results:
-        st.warning("⚠️ No relevant context found.")
+if st.button("Ask"):
+    if st.session_state.vectorstore is None:
+        st.warning("⚠️ Upload a document first")
         st.stop()
 
-    context = "\n\n".join([doc.page_content for doc in results])
+    retriever = st.session_state.vectorstore.as_retriever(search_kwargs={"k": 3})
+    docs = retriever.get_relevant_documents(question)
 
-    prompt = f"""
-You are a helpful assistant.
-Answer ONLY using the context below.
-If the answer is not in the context, say "I don't know."
+    context = "\n\n".join(doc.page_content for doc in docs)
 
-Context:
-{context}
+    llm = ChatGroq(
+        model="llama3-70b-8192",
+        temperature=0
+    )
 
-Question:
-{question}
-
-Answer:
-"""
-
-    try:
-        response = groq_client.chat.completions.create(
-            model="llama3-70b-8192",
-            messages=[
-                {"role": "system", "content": "You are a helpful RAG assistant."},
-                {"role": "user", "content": prompt},
-            ],
-            temperature=0,
+    messages = [
+        SystemMessage(
+            content=(
+                "You are a helpful assistant. "
+                "Answer ONLY using the provided context. "
+                "If the answer is not in the context, say 'I don't know'."
+            )
+        ),
+        HumanMessage(
+            content=f"Context:\n{context}\n\nQuestion:\n{question}"
         )
+    ]
 
-        answer = response.choices[0].message.content
+    response = llm.invoke(messages)
 
-        st.markdown("### 🤖 Answer")
-        st.write(answer)
-
-    except Exception as e:
-        st.error("❌ Error while generating answer")
-        st.exception(e)
+    st.markdown("### 🧠 Answer")
+    st.write(response.content)
