@@ -1,12 +1,13 @@
 import streamlit as st
-import tempfile
 import os
 
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_community.vectorstores import Chroma
-from langchain_community.embeddings import HuggingFaceEmbeddings
+from typing import List
+from groq import Groq
 
-from langchain_groq import ChatGroq
+from langchain_core.documents import Document
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_chroma import Chroma
 
 # -----------------------------
 # Streamlit config
@@ -20,92 +21,80 @@ st.set_page_config(
 st.title("📚 RAG Assistant")
 
 # -----------------------------
-# Initialize session state
+# Secrets / API key
 # -----------------------------
-if "vectorstore" not in st.session_state:
-    st.session_state.vectorstore = None
+GROQ_API_KEY = st.secrets.get("GROQ_API_KEY") or os.getenv("GROQ_API_KEY")
+if not GROQ_API_KEY:
+    st.error("❌ GROQ_API_KEY is missing in Streamlit secrets.")
+    st.stop()
 
-if "chat_history" not in st.session_state:
-    st.session_state.chat_history = []
+groq_client = Groq(api_key=GROQ_API_KEY)
 
 # -----------------------------
-# LLM (Groq)
+# Embeddings + Vector DB
 # -----------------------------
-llm = ChatGroq(
-    api_key=os.environ.get("GROQ_API_KEY"),
-    model="llama3-70b-8192",
-    temperature=0,
+EMBEDDINGS = HuggingFaceEmbeddings(
+    model_name="sentence-transformers/all-MiniLM-L6-v2"
 )
 
+@st.cache_resource
+def load_vectorstore():
+    return Chroma(
+        persist_directory="chroma_db",
+        embedding_function=EMBEDDINGS,
+    )
+
+vectorstore = load_vectorstore()
+
 # -----------------------------
-# File upload
+# Upload document
 # -----------------------------
-st.header("📄 Upload a document")
+st.subheader("📄 Upload a document")
 
 uploaded_file = st.file_uploader(
     "Upload a TXT document",
     type=["txt"],
 )
 
-if uploaded_file is not None:
-    with st.spinner("Indexing document..."):
-        # Save file temporarily
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".txt") as tmp:
-            tmp.write(uploaded_file.read())
-            file_path = tmp.name
+if uploaded_file:
+    text = uploaded_file.read().decode("utf-8")
 
-        # Load text
-        with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
-            text = f.read()
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=500,
+        chunk_overlap=50,
+    )
 
-        # Split text
-        splitter = RecursiveCharacterTextSplitter(
-            chunk_size=800,
-            chunk_overlap=150,
-        )
-        docs = splitter.create_documents([text])
+    docs: List[Document] = [
+        Document(page_content=chunk)
+        for chunk in splitter.split_text(text)
+    ]
 
-        # Embeddings
-        embeddings = HuggingFaceEmbeddings(
-            model_name="sentence-transformers/all-MiniLM-L6-v2"
-        )
-
-        # Vector store
-        vectorstore = Chroma.from_documents(
-            docs,
-            embedding=embeddings,
-        )
-
-        st.session_state.vectorstore = vectorstore
-        os.unlink(file_path)
+    vectorstore.add_documents(docs)
+    vectorstore.persist()
 
     st.success("✅ Document indexed successfully!")
 
 # -----------------------------
-# Ask questions
+# Ask a question
 # -----------------------------
-st.header("💬 Ask a question")
+st.subheader("💬 Ask a question")
 
 question = st.text_input("Enter your question")
 
-if st.button("Ask") and question:
-    if st.session_state.vectorstore is None:
-        st.error("❌ Please upload a document first.")
-    else:
-        with st.spinner("Thinking..."):
-            # Retrieve documents
-            docs = st.session_state.vectorstore.similarity_search(
-                question,
-                k=3,
-            )
+if st.button("Ask") and question.strip():
 
-            context = "\n\n".join(d.page_content for d in docs)
+    results = vectorstore.similarity_search(question, k=4)
 
-            prompt = f"""
-You are a Retrieval-Augmented Generation (RAG) assistant.
+    if not results:
+        st.warning("⚠️ No relevant context found.")
+        st.stop()
 
+    context = "\n\n".join([doc.page_content for doc in results])
+
+    prompt = f"""
+You are a helpful assistant.
 Answer ONLY using the context below.
-If the answer is not present, say: "I don't know."
+If the answer is not in the context, say "I don't know."
 
 Context:
 {context}
@@ -116,35 +105,21 @@ Question:
 Answer:
 """
 
-            # ✅ CORRECT Groq invocation (CHAT FORMAT)
-            response = llm.invoke(
-                [
-                    {
-                        "role": "system",
-                        "content": "You answer strictly from provided context.",
-                    },
-                    {
-                        "role": "user",
-                        "content": prompt,
-                    },
-                ]
-            )
+    try:
+        response = groq_client.chat.completions.create(
+            model="llama3-70b-8192",
+            messages=[
+                {"role": "system", "content": "You are a helpful RAG assistant."},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0,
+        )
 
-            answer = response.content
+        answer = response.choices[0].message.content
 
-        # Save history
-        st.session_state.chat_history.append(("You", question))
-        st.session_state.chat_history.append(("Assistant", answer))
+        st.markdown("### 🤖 Answer")
+        st.write(answer)
 
-# -----------------------------
-# Chat history
-# -----------------------------
-if st.session_state.chat_history:
-    st.divider()
-    st.subheader("🧠 Chat History")
-
-    for role, message in st.session_state.chat_history:
-        if role == "You":
-            st.markdown(f"**🧑 You:** {message}")
-        else:
-            st.markdown(f"**🤖 Assistant:** {message}")
+    except Exception as e:
+        st.error("❌ Error while generating answer")
+        st.exception(e)
