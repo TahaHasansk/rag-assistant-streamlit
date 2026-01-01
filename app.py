@@ -6,30 +6,38 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_chroma import Chroma
 from langchain_groq import ChatGroq
+from langchain_core.prompts import ChatPromptTemplate
 
-# ---------------- CONFIG ----------------
+# -------------------------------
+# Streamlit UI
+# -------------------------------
 st.set_page_config(page_title="RAG Assistant", page_icon="📚")
-
-PERSIST_DIR = "chroma_db"
-
-# ---------------- UI ----------------
 st.title("📚 RAG Assistant")
 st.write("Upload a TXT file and ask questions about it.")
 
+# -------------------------------
+# Environment
+# -------------------------------
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+if not GROQ_API_KEY:
+    st.error("❌ GROQ_API_KEY not set in Streamlit secrets")
+    st.stop()
+
+# -------------------------------
+# Upload file
+# -------------------------------
 uploaded_file = st.file_uploader("Upload a .txt document", type=["txt"])
 
-# ---------------- EMBEDDINGS ----------------
+# -------------------------------
+# Initialize embeddings once
+# -------------------------------
 embeddings = HuggingFaceEmbeddings(
     model_name="sentence-transformers/all-MiniLM-L6-v2"
 )
 
-# ---------------- LOAD VECTOR STORE ----------------
-vectorstore = Chroma(
-    persist_directory=PERSIST_DIR,
-    embedding_function=embeddings
-)
-
-# ---------------- FILE INGESTION ----------------
+# -------------------------------
+# Handle document upload
+# -------------------------------
 if uploaded_file:
     text = uploaded_file.read().decode("utf-8")
 
@@ -39,34 +47,35 @@ if uploaded_file:
     )
 
     chunks = splitter.split_text(text)
-    documents = [Document(page_content=c) for c in chunks]
 
-    vectorstore.add_documents(documents)
+    documents = [Document(page_content=chunk) for chunk in chunks]
+
+    vectorstore = Chroma.from_documents(
+        documents=documents,
+        embedding=embeddings
+    )
+
+    retriever = vectorstore.as_retriever(search_kwargs={"k": 4})
 
     st.success("✅ Document indexed successfully!")
 
-# ---------------- QUESTION ----------------
-question = st.text_input("Ask a question")
+    # -------------------------------
+    # Ask a question
+    # -------------------------------
+    question = st.text_input("Ask a question")
 
-if question:
-    retriever = vectorstore.as_retriever(search_kwargs={"k": 4})
+    ask = st.button("Ask")
 
-    docs = retriever.invoke(question)
+    if ask and question:
+        # Retrieve documents (CORRECT API)
+        docs = retriever.invoke(question)
 
-    if not docs:
-        st.warning("No relevant content found.")
-    else:
         context = "\n\n".join(d.page_content for d in docs)
 
-        llm = ChatGroq(
-            model="llama3-8b-8192",
-            temperature=0,
-            groq_api_key=st.secrets["GROQ_API_KEY"]
-        )
-
-        prompt = f"""
-You are a helpful assistant.
-Answer ONLY using the context below.
+        prompt = ChatPromptTemplate.from_template(
+            """You are a helpful assistant.
+Use ONLY the context below to answer.
+If the answer is not in the context, say "I don't know".
 
 Context:
 {context}
@@ -74,8 +83,19 @@ Context:
 Question:
 {question}
 """
+        )
 
-        response = llm.invoke(prompt)
+        llm = ChatGroq(
+            api_key=GROQ_API_KEY,
+            model="llama-3.1-70b-versatile",
+            temperature=0
+        )
 
-        st.subheader("Answer")
+        chain = prompt | llm
+
+        response = chain.invoke(
+            {"context": context, "question": question}
+        )
+
+        st.markdown("### Answer")
         st.write(response.content)
