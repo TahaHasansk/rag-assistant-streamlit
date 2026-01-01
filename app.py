@@ -4,20 +4,26 @@ from typing import List
 
 from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_community.embeddings import SentenceTransformerEmbeddings
+from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_chroma import Chroma
 from langchain_groq import ChatGroq
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.output_parsers import StrOutputParser
+from langchain.chains import RetrievalQA
 
 from pypdf import PdfReader
+
 
 # -----------------------------
 # STREAMLIT CONFIG
 # -----------------------------
-st.set_page_config(page_title="RAG Assistant", page_icon="📚")
+st.set_page_config(
+    page_title="RAG Assistant",
+    page_icon="📚",
+    layout="centered",
+)
+
 st.title("📚 RAG Assistant")
 st.caption("Upload TXT or PDF files and ask questions about them.")
+
 
 # -----------------------------
 # CHECK GROQ API KEY
@@ -26,136 +32,128 @@ if "GROQ_API_KEY" not in os.environ:
     st.error("❌ GROQ_API_KEY not found. Add it in Streamlit → App settings → Secrets.")
     st.stop()
 
-# -----------------------------
-# EMBEDDINGS (STREAMLIT SAFE)
-# -----------------------------
-embeddings = SentenceTransformerEmbeddings(
-    model_name="sentence-transformers/all-MiniLM-L6-v2",
-    device="cpu"
-)
 
 # -----------------------------
-# VECTOR STORE (PERSISTENT)
-# -----------------------------
-VECTOR_DIR = "chroma_db"
-
-vectorstore = Chroma(
-    persist_directory=VECTOR_DIR,
-    embedding_function=embeddings
-)
-
-retriever = vectorstore.as_retriever(search_kwargs={"k": 4})
-
-# -----------------------------
-# LLM (GROQ)
-# -----------------------------
-llm = ChatGroq(
-    model="llama3-70b-8192",
-    temperature=0
-)
-
-# -----------------------------
-# PROMPT
-# -----------------------------
-prompt = ChatPromptTemplate.from_messages(
-    [
-        (
-            "system",
-            "You are a helpful assistant. Answer ONLY using the provided context.\n"
-            "If the answer is not in the context, say you don't know."
-        ),
-        ("human", "Context:\n{context}\n\nQuestion:\n{question}")
-    ]
-)
-
-chain = prompt | llm | StrOutputParser()
-
-# -----------------------------
-# FILE PROCESSING
+# FILE READERS
 # -----------------------------
 def read_txt(file) -> str:
     return file.read().decode("utf-8", errors="ignore")
+
 
 def read_pdf(file) -> str:
     reader = PdfReader(file)
     text = ""
     for page in reader.pages:
-        text += page.extract_text() or ""
+        page_text = page.extract_text()
+        if page_text:
+            text += page_text + "\n"
     return text
 
-def process_files(files: List) -> List[Document]:
-    documents: List[Document] = []
-
-    for file in files:
-        if file.name.lower().endswith(".txt"):
-            text = read_txt(file)
-        elif file.name.lower().endswith(".pdf"):
-            text = read_pdf(file)
-        else:
-            continue
-
-        if not text.strip():
-            continue
-
-        documents.append(
-            Document(
-                page_content=text,
-                metadata={"source": file.name}
-            )
-        )
-
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=1000,
-        chunk_overlap=150
-    )
-
-    return splitter.split_documents(documents)
 
 # -----------------------------
-# UI — FILE UPLOAD
+# FILE UPLOAD
 # -----------------------------
 uploaded_files = st.file_uploader(
     "Upload TXT or PDF files",
     type=["txt", "pdf"],
-    accept_multiple_files=True
+    accept_multiple_files=True,
 )
 
-if uploaded_files:
-    docs = process_files(uploaded_files)
+if not uploaded_files:
+    st.stop()
 
-    if docs:
-        vectorstore.add_documents(docs)
-        vectorstore.persist()
-        st.success("✅ Document(s) indexed successfully!")
-    else:
-        st.warning("⚠️ No readable text found in uploaded files.")
 
 # -----------------------------
-# UI — QUESTION ANSWERING
+# LOAD DOCUMENTS
 # -----------------------------
-st.divider()
-st.subheader("Ask a question")
+documents: List[Document] = []
 
-question = st.text_input("Enter your question")
-
-if question:
-    retrieved_docs = retriever.invoke(question)
-
-    if not retrieved_docs:
-        st.info("No relevant context found.")
+for file in uploaded_files:
+    if file.type == "text/plain":
+        content = read_txt(file)
+    elif file.type == "application/pdf":
+        content = read_pdf(file)
     else:
-        context = "\n\n".join(doc.page_content for doc in retrieved_docs)
+        continue
 
-        response = chain.invoke(
-            {
-                "context": context,
-                "question": question
-            }
+    if content.strip():
+        documents.append(
+            Document(
+                page_content=content,
+                metadata={"source": file.name},
+            )
         )
 
-        st.markdown("### Answer")
-        st.write(response)
+if not documents:
+    st.error("No readable content found.")
+    st.stop()
 
-        st.markdown("### Sources")
-        for doc in retrieved_docs:
-            st.write(f"- {doc.metadata.get('source', 'unknown')}")
+
+# -----------------------------
+# SPLIT DOCUMENTS
+# -----------------------------
+splitter = RecursiveCharacterTextSplitter(
+    chunk_size=1000,
+    chunk_overlap=150,
+)
+
+chunks = splitter.split_documents(documents)
+
+if not chunks:
+    st.error("Document splitting failed.")
+    st.stop()
+
+
+# -----------------------------
+# EMBEDDINGS (SAFE)
+# -----------------------------
+embeddings = HuggingFaceEmbeddings(
+    model_name="sentence-transformers/all-MiniLM-L6-v2"
+)
+
+
+# -----------------------------
+# VECTOR STORE
+# -----------------------------
+vectorstore = Chroma.from_documents(
+    documents=chunks,
+    embedding=embeddings,
+)
+
+retriever = vectorstore.as_retriever(search_kwargs={"k": 4})
+
+
+# -----------------------------
+# LLM (GROQ SAFE MODEL)
+# -----------------------------
+llm = ChatGroq(
+    model="llama-3.1-8b-instant",
+    temperature=0,
+)
+
+
+# -----------------------------
+# RAG CHAIN
+# -----------------------------
+qa_chain = RetrievalQA.from_chain_type(
+    llm=llm,
+    retriever=retriever,
+    return_source_documents=True,
+)
+
+
+# -----------------------------
+# QUESTION UI
+# -----------------------------
+question = st.text_input("Ask a question")
+
+if question:
+    with st.spinner("Thinking..."):
+        result = qa_chain.invoke({"query": question})
+
+    st.subheader("Answer")
+    st.write(result["result"])
+
+    st.subheader("Sources")
+    for doc in result["source_documents"]:
+        st.markdown(f"- **{doc.metadata.get('source', 'Unknown')}**")
