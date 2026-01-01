@@ -19,18 +19,18 @@ st.set_page_config(
 )
 
 st.title("🧠 RAG Assistant")
-st.caption("Upload documents and ask questions based on their content")
+st.caption("Upload TXT or PDF documents and ask questions based on their content")
 
 # =====================================================
-# LLM
+# LLM (Groq)
 # =====================================================
 llm = ChatGroq(
-    model="llama-3.1-8b-instant",
+    model="llama-3.1-8b-instant",  # ✅ VALID MODEL
     temperature=0
 )
 
 # =====================================================
-# EMBEDDINGS + VECTORSTORE (cached)
+# VECTORSTORE (cached)
 # =====================================================
 @st.cache_resource
 def get_vectorstore():
@@ -39,98 +39,83 @@ def get_vectorstore():
     )
     return Chroma(
         embedding_function=embeddings,
-        persist_directory="./chroma_db"
+        persist_directory="chroma_db"
     )
 
 vectorstore = get_vectorstore()
 
 # =====================================================
-# DOCUMENT LOADING
+# FILE UPLOAD
 # =====================================================
-def load_documents(uploaded_files):
-    documents = []
-
-    for file in uploaded_files:
-        if file.name.endswith(".txt"):
-            text = file.read().decode("utf-8", errors="ignore")
-
-        elif file.name.endswith(".pdf"):
-            reader = PdfReader(file)
-            text = ""
-            for page in reader.pages:
-                page_text = page.extract_text()
-                if page_text:
-                    text += page_text + "\n"
-
-        else:
-            continue
-
-        if text.strip():
-            documents.append(
-                Document(
-                    page_content=text,
-                    metadata={"source": file.name}
-                )
-            )
-
-    return documents
-
-# =====================================================
-# UPLOAD SECTION
-# =====================================================
-st.markdown("---")
-st.subheader("📂 Upload Documents")
-st.caption("TXT & PDF • Multiple files supported")
-
+st.subheader("📄 Upload documents")
 uploaded_files = st.file_uploader(
-    "Upload files",
+    "Upload TXT or PDF files",
     type=["txt", "pdf"],
     accept_multiple_files=True
 )
 
 if uploaded_files:
-    with st.spinner("📄 Processing documents..."):
-        docs = load_documents(uploaded_files)
+    documents = []
 
-        if not docs:
-            st.error("❌ No readable text found in uploaded files.")
-            st.stop()
+    for uploaded_file in uploaded_files:
+        if uploaded_file.name.endswith(".txt"):
+            text = uploaded_file.read().decode("utf-8", errors="ignore")
+            documents.append(
+                Document(
+                    page_content=text,
+                    metadata={"source": uploaded_file.name}
+                )
+            )
 
+        elif uploaded_file.name.endswith(".pdf"):
+            reader = PdfReader(uploaded_file)
+            for page_num, page in enumerate(reader.pages):
+                page_text = page.extract_text()
+                if page_text and page_text.strip():
+                    documents.append(
+                        Document(
+                            page_content=page_text,
+                            metadata={
+                                "source": uploaded_file.name,
+                                "page": page_num + 1
+                            }
+                        )
+                    )
+
+    if documents:
         splitter = RecursiveCharacterTextSplitter(
             chunk_size=1000,
-            chunk_overlap=200
+            chunk_overlap=150
         )
 
-        # 🔥 SPLIT
-        chunks = splitter.split_documents(docs)
+        chunks = splitter.split_documents(documents)
 
-        # 🔥 CRITICAL FIX — FILTER EMPTY CHUNKS
-        filtered_chunks = [
-            c for c in chunks
-            if c.page_content and c.page_content.strip()
-        ]
+        # ✅ CRITICAL FIX: remove empty chunks
+        chunks = [c for c in chunks if c.page_content.strip()]
 
-        if not filtered_chunks:
-            st.error("❌ All document chunks were empty after processing.")
-            st.stop()
-
-        vectorstore.add_documents(filtered_chunks)
-
-        st.success(f"✅ Indexed {len(filtered_chunks)} chunks successfully!")
+        if chunks:
+            vectorstore.add_documents(chunks)
+            st.success(f"✅ Added {len(chunks)} chunks to the knowledge base")
+        else:
+            st.warning("⚠️ No valid text found after splitting")
 
 # =====================================================
-# QUESTION SECTION
+# QUESTION ANSWERING
 # =====================================================
-st.markdown("---")
+st.divider()
 st.subheader("💬 Ask a Question")
 
-query = st.text_input("Enter your question")
+question = st.text_input("Enter your question")
 
-if query:
-    with st.spinner("🤖 Thinking..."):
-        retriever = vectorstore.as_retriever(search_kwargs={"k": 4})
-        docs = retriever.get_relevant_documents(query)
+if question:
+    retriever = vectorstore.as_retriever(search_kwargs={"k": 4})
 
+    # ✅ LangChain 1.x correct call
+    docs = retriever.invoke(question)
+
+    if not docs:
+        st.warning("No relevant context found.")
+    else:
         context = "\n\n".join(d.page_content for d in docs)
 
         prompt = f"""
@@ -141,14 +126,24 @@ Context:
 {context}
 
 Question:
-{query}
+{question}
+
+Answer:
 """
 
-        response = llm.invoke(prompt)
+        answer = llm.invoke(prompt)
 
-        st.markdown("### ✅ Answer")
-        st.write(response.content)
+        st.markdown("### 🧠 Answer")
+        st.write(answer.content)
 
-        with st.expander("📚 Sources"):
-            for d in docs:
-                st.markdown(f"- **{d.metadata.get('source', 'unknown')}**")
+        # =====================================================
+        # SOURCES
+        # =====================================================
+        st.markdown("### 📚 Sources")
+        for i, doc in enumerate(docs, start=1):
+            source = doc.metadata.get("source", "Unknown")
+            page = doc.metadata.get("page")
+            if page:
+                st.write(f"{i}. {source} (page {page})")
+            else:
+                st.write(f"{i}. {source}")
