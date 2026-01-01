@@ -30,10 +30,26 @@ if not GROQ_API_KEY:
 os.environ["GROQ_API_KEY"] = GROQ_API_KEY
 
 # -------------------------------------------------
-# Session state
+# Models
+# -------------------------------------------------
+embeddings = HuggingFaceEmbeddings(
+    model_name="sentence-transformers/all-MiniLM-L6-v2"
+)
+
+llm = ChatGroq(
+    model="llama3-70b-8192",
+    temperature=0,
+)
+
+# -------------------------------------------------
+# Session state (VECTORSTORE)
 # -------------------------------------------------
 if "vectorstore" not in st.session_state:
-    st.session_state.vectorstore = None
+    st.session_state.vectorstore = Chroma(
+        embedding_function=embeddings
+    )
+
+vectorstore = st.session_state.vectorstore
 
 # -------------------------------------------------
 # Upload document
@@ -41,7 +57,7 @@ if "vectorstore" not in st.session_state:
 st.header("📄 Upload a document")
 
 uploaded_file = st.file_uploader(
-    "Upload a TXT file",
+    "Upload a TXT document",
     type=["txt"]
 )
 
@@ -54,17 +70,9 @@ if uploaded_file:
     )
 
     chunks = splitter.split_text(text)
+    documents = [Document(page_content=c) for c in chunks]
 
-    documents = [Document(page_content=chunk) for chunk in chunks]
-
-    embeddings = HuggingFaceEmbeddings(
-        model_name="sentence-transformers/all-MiniLM-L6-v2"
-    )
-
-    st.session_state.vectorstore = Chroma.from_documents(
-        documents=documents,
-        embedding=embeddings
-    )
+    vectorstore.add_documents(documents)
 
     st.success("✅ Document indexed successfully!")
 
@@ -75,20 +83,15 @@ st.header("💬 Ask a question")
 
 question = st.text_input("Enter your question")
 
-if st.button("Ask"):
-    if st.session_state.vectorstore is None:
-        st.warning("⚠️ Upload a document first")
-        st.stop()
-
-    retriever = st.session_state.vectorstore.as_retriever(search_kwargs={"k": 3})
+if st.button("Ask") and question:
+    retriever = vectorstore.as_retriever(search_kwargs={"k": 3})
     docs = retriever.get_relevant_documents(question)
 
-    context = "\n\n".join(doc.page_content for doc in docs)
+    if not docs:
+        st.warning("No relevant context found.")
+        st.stop()
 
-    llm = ChatGroq(
-        model="llama3-70b-8192",
-        temperature=0
-    )
+    context = "\n\n".join(d.page_content for d in docs)
 
     messages = [
         SystemMessage(
@@ -100,10 +103,10 @@ if st.button("Ask"):
         ),
         HumanMessage(
             content=f"Context:\n{context}\n\nQuestion:\n{question}"
-        )
+        ),
     ]
 
     response = llm.invoke(messages)
 
-    st.markdown("### 🧠 Answer")
+    st.markdown("### 🤖 Answer")
     st.write(response.content)
