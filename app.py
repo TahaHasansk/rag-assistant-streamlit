@@ -41,10 +41,12 @@ retriever = vectorstore.as_retriever(search_kwargs={"k": 4})
 # -----------------------------
 # FILE UPLOAD
 # -----------------------------
-uploaded_file = st.file_uploader("Upload a .txt document", type=["txt"])
+uploaded_files = st.file_uploader("Upload  .txt documents", type=["txt"],accept_multiple_files=True)
 
-if uploaded_file:
-    text = uploaded_file.read().decode("utf-8")
+if uploaded_files:
+    for uploaded_file in uploaded_files:
+	text = uploaded_file.read().decode("utf-8")
+	documents.append(text)
 
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=500,
