@@ -1,173 +1,138 @@
+import os
 import streamlit as st
+from typing import List
+
 from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_chroma import Chroma
 from langchain_groq import ChatGroq
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import StrOutputParser
+
 from pypdf import PdfReader
 
-# =====================================================
-# PAGE CONFIG (Apple-style)
-# =====================================================
-st.set_page_config(
-    page_title="RAG Assistant",
-    page_icon="🧠",
-    layout="wide"
+# -----------------------------
+# STREAMLIT CONFIG
+# -----------------------------
+st.set_page_config(page_title="RAG Assistant", page_icon="📚")
+st.title("📚 RAG Assistant")
+st.caption("Upload TXT or PDF files and ask questions about them.")
+
+# -----------------------------
+# CHECK GROQ API KEY
+# -----------------------------
+if "GROQ_API_KEY" not in os.environ:
+    st.error("❌ GROQ_API_KEY not found. Add it in Streamlit → App settings → Secrets.")
+    st.stop()
+
+# -----------------------------
+# EMBEDDINGS & VECTOR STORE
+# -----------------------------
+embeddings = HuggingFaceEmbeddings(
+    model_name="sentence-transformers/all-MiniLM-L6-v2"
 )
 
-st.markdown(
-    """
-    <style>
-    body {
-        background-color: #0e0e11;
-        color: #ffffff;
-    }
-    .block-container {
-        padding-top: 3rem;
-        max-width: 1100px;
-    }
-    input, textarea {
-        border-radius: 14px !important;
-        border: 1px solid #333 !important;
-    }
-    </style>
-    """,
-    unsafe_allow_html=True
+VECTOR_DIR = "chroma_db"
+
+vectorstore = Chroma(
+    persist_directory=VECTOR_DIR,
+    embedding_function=embeddings
 )
 
-st.title("🧠 RAG Assistant")
-st.caption("Upload a document. Ask questions. Get grounded answers.")
-
-# =====================================================
-# LLM (Groq)
-# =====================================================
-llm = ChatGroq(
-    model="llama-3.1-8b-instant",
-    temperature=0
-)
-
-# =====================================================
-# SESSION STATE
-# =====================================================
-if "vectorstore" not in st.session_state:
-    st.session_state.vectorstore = None
-
-# =====================================================
-# FILE UPLOAD
-# =====================================================
-st.subheader("📄 Upload documents")
-
+# -----------------------------
+# FILE UPLOAD (MULTI + TXT + PDF)
+# -----------------------------
 uploaded_files = st.file_uploader(
-    "TXT or PDF only",
+    "Upload documents",
     type=["txt", "pdf"],
     accept_multiple_files=True
 )
 
-if uploaded_files:
-    documents: list[Document] = []
+def load_documents(files) -> List[Document]:
+    documents = []
 
-    for file in uploaded_files:
-        if file.name.endswith(".txt"):
-            text = file.read().decode("utf-8", errors="ignore")
-            if text.strip():
-                documents.append(
-                    Document(
-                        page_content=text,
-                        metadata={"source": file.name}
-                    )
+    for file in files:
+        if file.type == "text/plain":
+            text = file.read().decode("utf-8")
+            documents.append(
+                Document(
+                    page_content=text,
+                    metadata={"source": file.name}
                 )
+            )
 
-        elif file.name.endswith(".pdf"):
+        elif file.type == "application/pdf":
             reader = PdfReader(file)
-            for page_num, page in enumerate(reader.pages, start=1):
+            full_text = ""
+            for page in reader.pages:
                 page_text = page.extract_text()
-                if page_text and page_text.strip():
-                    documents.append(
-                        Document(
-                            page_content=page_text,
-                            metadata={
-                                "source": file.name,
-                                "page": page_num
-                            }
-                        )
-                    )
+                if page_text:
+                    full_text += page_text + "\n"
 
-    if not documents:
-        st.warning("No readable text found in uploaded files.")
-    else:
+            documents.append(
+                Document(
+                    page_content=full_text,
+                    metadata={"source": file.name}
+                )
+            )
+
+    return documents
+
+if uploaded_files:
+    with st.spinner("📄 Processing documents..."):
+        docs = load_documents(uploaded_files)
+
         splitter = RecursiveCharacterTextSplitter(
             chunk_size=1000,
-            chunk_overlap=150
+            chunk_overlap=200
         )
 
-        chunks = splitter.split_documents(documents)
+        chunks = splitter.split_documents(docs)
+        vectorstore.add_documents(chunks)
 
-        # 🔥 CRITICAL FIX: remove empty chunks
-        chunks = [c for c in chunks if c.page_content.strip()]
+    st.success("✅ Documents indexed successfully!")
 
-        embeddings = HuggingFaceEmbeddings(
-            model_name="sentence-transformers/all-MiniLM-L6-v2"
-        )
-
-        # 🔥 CRITICAL FIX: NEW VECTORSTORE PER UPLOAD (NO PERSISTENCE)
-        st.session_state.vectorstore = Chroma.from_documents(
-            documents=chunks,
-            embedding=embeddings
-        )
-
-        st.success(f"Indexed {len(chunks)} chunks successfully.")
-
-# =====================================================
+# -----------------------------
 # QUESTION ANSWERING
-# =====================================================
-st.divider()
-st.subheader("💬 Ask a question")
-
-question = st.text_input(
-    "What would you like to know?",
-    placeholder="What is this document about?"
-)
+# -----------------------------
+question = st.text_input("Ask a question")
 
 if question:
-    if st.session_state.vectorstore is None:
-        st.warning("Please upload a document first.")
-    else:
-        retriever = st.session_state.vectorstore.as_retriever(
-            search_kwargs={"k": 4}
-        )
+    retriever = vectorstore.as_retriever(search_kwargs={"k": 4})
 
-        # ✅ CORRECT LangChain 1.x API
-        docs = retriever.invoke(question)
+    context_docs = retriever.invoke(question)
+    context_text = "\n\n".join(doc.page_content for doc in context_docs)
 
-        if not docs:
-            st.warning("No relevant information found.")
-        else:
-            context = "\n\n".join(doc.page_content for doc in docs)
-
-            prompt = f"""
-You are a precise assistant.
-Answer ONLY using the context below.
-If the answer is not present, say "Not found in the document."
+    prompt = ChatPromptTemplate.from_template(
+        """
+You are a helpful assistant.
+Answer the question ONLY using the context below.
+If the answer is not in the context, say "I don't know".
 
 Context:
 {context}
 
 Question:
 {question}
-
-Answer:
 """
+    )
 
-            response = llm.invoke(prompt)
+    llm = ChatGroq(
+        model="llama-3.1-8b-instant",
+        temperature=0
+    )
 
-            st.markdown("### 🧠 Answer")
-            st.write(response.content)
+    chain = (
+        prompt
+        | llm
+        | StrOutputParser()
+    )
 
-            st.markdown("### 📚 Sources")
-            for i, doc in enumerate(docs, start=1):
-                source = doc.metadata.get("source", "Unknown")
-                page = doc.metadata.get("page")
-                if page:
-                    st.write(f"{i}. {source} — page {page}")
-                else:
-                    st.write(f"{i}. {source}")
+    with st.spinner("🤖 Thinking..."):
+        answer = chain.invoke(
+            {"context": context_text, "question": question}
+        )
+
+    st.markdown("### Answer")
+    st.write(answer)
