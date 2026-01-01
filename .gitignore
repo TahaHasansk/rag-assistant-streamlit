@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.env
+
+# Chroma / Vector DB
+data/
+chroma/
+*.sqlite3
+
+# Docker
+*.log
+
+# Streamlit
+.streamlit/secrets.toml
+
+# OS
+.DS_Store
+
+.venv/
+__pycache__/
+*.pyc
+.env
+chroma_db/
+.DS_Store
